@@ -5,7 +5,8 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications import ResNet50
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras import regularizers
 
 
 def generator(datagen: ImageDataGenerator, diretorio: str, height: int, width: int,
@@ -44,13 +45,16 @@ batch_size = 16
 
 # Data Augmentation
 train_datagen = ImageDataGenerator(
-    rescale=1. / 255,
-    rotation_range=20,
-    width_shift_range=0.1,
-    height_shift_range=0.1,
-    shear_range=0.1,
-    zoom_range=0.1,
-    horizontal_flip=True
+    rescale=1./255,
+    rotation_range=30,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.2,
+    zoom_range=0.2,
+    brightness_range=[0.8, 1.2],
+    horizontal_flip=True,
+    vertical_flip=True,   # cuidado: só se fizer sentido no dataset
+    fill_mode="nearest"
 )
 
 test_datagen = ImageDataGenerator(rescale=1. / 255)
@@ -73,9 +77,9 @@ for layer in base_model.layers:
 model = Sequential([
     base_model,
     GlobalAveragePooling2D(),
-    Dense(256, activation="relu"),
+    Dense(256, activation="relu", kernel_regularizer=regularizers.l2(0.001)),
     Dropout(0.5),
-    Dense(1, activation="sigmoid")
+    Dense(1, activation="sigmoid", kernel_regularizer=regularizers.l2(0.001))
 ])
 
 model.compile(
@@ -90,9 +94,9 @@ os.makedirs("Model", exist_ok=True)
 
 callbacks = [
     EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
-    ModelCheckpoint("Model/resnet_tomato.h5", monitor="val_loss", save_best_only=True)
+    ModelCheckpoint("Model/resnet_tomato.h5", monitor="val_loss", save_best_only=True),
+    ReduceLROnPlateau(monitor="val_loss", factor=0.2, patience=3, verbose=1)
 ]
-
 GPU = tf.config.list_physical_devices('GPU')
 if GPU:
     try:
