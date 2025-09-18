@@ -7,6 +7,8 @@ from tensorflow.keras.applications import EfficientNetB0
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
 
+from ResNet.main import callbacks
+
 
 def generator(datagen: ImageDataGenerator, diretorio: str, height: int, width: int,
               batch_size: int) -> ImageDataGenerator:
@@ -89,11 +91,7 @@ model.compile(
     metrics=["accuracy"]
 )
 
-callbacks = [
-    EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
-    ModelCheckpoint("Model/efficientNet_tomato.h5", monitor="val_loss", save_best_only=True),
-    ReduceLROnPlateau(monitor="val_loss", factor=0.2, patience=3, verbose=1)
-]
+callbacks = None
 
 GPU = tf.config.list_physical_devices('GPU')
 if GPU:
@@ -114,6 +112,16 @@ else:
         validation_data=val_generator,
         callbacks=callbacks
     )
+
+# antes de callbacks
+os.makedirs("Model", exist_ok=True)
+
+callbacks = [
+    EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
+    # use o formato nativo .keras (evita vários problemas de serialização)
+    ModelCheckpoint("Model/efficientNet_tomato.keras", monitor="val_loss", save_best_only=True),
+    ReduceLROnPlateau(monitor="val_loss", factor=0.2, patience=3, verbose=1)
+]
 
 loss, acc = model.evaluate(test_generator)
 print(f"\nAcurácia no conjunto de teste: {acc:.4f}")
