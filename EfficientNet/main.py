@@ -117,3 +117,4 @@ else:
 
 loss, acc = model.evaluate(test_generator)
 print(f"\nAcurácia no conjunto de teste: {acc:.4f}")
+
