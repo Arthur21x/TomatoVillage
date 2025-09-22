@@ -1,128 +1,201 @@
-import tensorflow as tf
+# main_efficientnet_allinone.py
+import os, math, hashlib, random
 from pathlib import Path
-import os
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+import numpy as np
+import matplotlib.pyplot as plt
+
+import tensorflow as tf
+from tensorflow.keras import layers, models
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications import EfficientNetB0
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
+from tensorflow.keras.applications.efficientnet import preprocess_input
+from sklearn.metrics import classification_report, confusion_matrix
 
-from ResNet.main import callbacks
+# =========================
+# Config
+# =========================
+SEED = 42
+random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
 
+CAMINHO_RAIZ = Path(__file__).resolve().parent.parent   # ajuste se necessário
+DATASET_DIR = os.path.join(CAMINHO_RAIZ, "dataset")     # dataset/{train,val,test}/{classe1,classe2}
+IMG_SIZE = (224, 224)                                   # igual no treino e na avaliação
+BATCH = 32
+EPOCHS_WARMUP = 3
+EPOCHS_FT = 6
 
-def generator(datagen: ImageDataGenerator, diretorio: str, height: int, width: int,
-              batch_size: int) -> ImageDataGenerator:
-    """
-    Gera um ImageDataGenerator a partir de um diretório de imagens.
-
-    :param datagen: O ImageDataGenerator a ser usado.
-    :type datagen: ImageDataGenerator
-    :param diretorio: O diretório contendo as imagens.
-    :type diretorio: str
-    :param height: A altura das imagens.
-    :type height: int
-    :param width: A largura das imagens.
-    :type width: int
-    :param batch_size: O tamanho do batch de imagens.
-    :type batch_size: int
-    :return: Um ImageDataGenerator.
-    :rtype: ImageDataGenerator
-    """
-    generador: ImageDataGenerator = datagen.flow_from_directory(
-        os.path.join(dataset_dir, diretorio),
-        target_size=(height, width),
-        batch_size=batch_size,
-        class_mode="binary"
+# =========================
+# Helpers
+# =========================
+def make_gen(split):
+    dg = ImageDataGenerator(preprocessing_function=preprocess_input)
+    gen = dg.flow_from_directory(
+        os.path.join(DATASET_DIR, split),
+        target_size=IMG_SIZE,
+        batch_size=BATCH,
+        class_mode="binary",
+        shuffle=(split == "train")  # embaralha só no treino
     )
-    return generador
+    return gen
 
+def check_leakage(train_gen, val_gen, test_gen, max_show=5):
+    # interseção por NOME DE ARQUIVO
+    def names(gen): return {Path(p).name for p in gen.filepaths}
+    trn, val, tst = names(train_gen), names(val_gen), names(test_gen)
+    n_tr_val = trn & val
+    n_tr_tst = trn & tst
+    n_val_tst = val & tst
 
-# Diretórios
-CAMINHO_RAIZ = Path(__file__).resolve().parent.parent
-dataset_dir = os.path.join(CAMINHO_RAIZ, "dataset")
+    # interseção por HASH MD5 (custo: lê arquivos; ok para conjuntos pequenos/médios)
+    def md5_set(gen):
+        hs = set()
+        for p in gen.filepaths:
+            with open(p, "rb") as f: 
+                hs.add(hashlib.md5(f.read()).hexdigest())
+        return hs
+    h_tr, h_val, h_tst = md5_set(train_gen), md5_set(val_gen), md5_set(test_gen)
+    h_tr_val = h_tr & h_val
+    h_tr_tst = h_tr & h_tst
+    h_val_tst = h_val & h_tst
 
-train_dir = os.path.join(dataset_dir, "train")
-val_dir = os.path.join(dataset_dir, "val")
-test_dir = os.path.join(dataset_dir, "test")
+    # imprime resultados
+    print("\n=== Checagem de Vazamento ===")
+    print(f"Interseção (NOMES)  TR∩VAL: {len(n_tr_val)} | TR∩TEST: {len(n_tr_tst)} | VAL∩TEST: {len(n_val_tst)}")
+    print(f"Interseção (HASH)   TR∩VAL: {len(h_tr_val)} | TR∩TEST: {len(h_tr_tst)} | VAL∩TEST: {len(h_val_tst)}")
 
-img_height, img_width = 192, 192
-batch_size = 32
-epochs = 15
+    leaked = any([n_tr_val, n_tr_tst, n_val_tst, h_tr_val, h_tr_tst, h_val_tst])
+    if leaked:
+        print("\033[91m[ALERTA]\033[0m Vazamento detectado entre splits! Exemplos (nomes):")
+        for title, s in [("TR∩VAL", n_tr_val), ("TR∩TEST", n_tr_tst), ("VAL∩TEST", n_val_tst)]:
+            if s:
+                print(f"  {title}: " + ", ".join(list(s)[:max_show]))
+    else:
+        print("\033[92m[OK]\033[0m Nenhum vazamento detectado por nome nem por hash.")
 
-# Data Augmentation
-train_datagen = ImageDataGenerator(
-    rescale=1. / 255,
-    rotation_range=30,
-    width_shift_range=0.2,
-    height_shift_range=0.2,
-    shear_range=0.2,
-    zoom_range=0.2,
-    brightness_range=[0.8, 1.2],
-    horizontal_flip=True,
-    vertical_flip=True,  # cuidado: só se fizer sentido no dataset
-    fill_mode="nearest"
+    return not leaked
+
+def plot_confusion(cm, class_names, title):
+    plt.figure(figsize=(6,5))
+    plt.imshow(cm)
+    plt.colorbar()
+    plt.xticks(ticks=range(len(class_names)), labels=class_names)
+    plt.yticks(ticks=range(len(class_names)), labels=class_names)
+    plt.xlabel("Previsto"); plt.ylabel("Verdadeiro")
+    plt.title(title)
+    vmax = cm.max() if cm.size else 1
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            c = "white" if cm[i, j] > vmax/2 else "black"
+            plt.text(j, i, str(cm[i, j]), ha="center", va="center", color=c)
+    plt.tight_layout()
+    plt.show()
+
+def show_misclassified(gen, y_true, y_pred, class_names, max_images=9, split_name="Validação"):
+    errors = np.where(y_true != y_pred)[0]
+    print(f"Foram encontrados {len(errors)} erros em {split_name}.")
+    if len(errors) == 0:
+        return
+    n = min(max_images, len(errors))
+    plt.figure(figsize=(12,12))
+    for k, idx in enumerate(errors[:n]):
+        img_path = gen.filepaths[idx]
+        img = plt.imread(img_path)  # só para visualização
+        plt.subplot(3,3,k+1)
+        plt.imshow(img); plt.axis("off")
+        t = class_names[int(y_true[idx])]
+        p = class_names[int(y_pred[idx])]
+        plt.title(f"V: {t} | P: {p}", color="red", fontsize=10)
+    plt.suptitle(f"Exemplos de Erros — {split_name}", fontsize=14)
+    plt.tight_layout(rect=[0,0.03,1,0.95])
+    plt.show()
+
+def evaluate_split(model, gen, split_label):
+    class_names = list(gen.class_indices.keys())
+    loss, acc = model.evaluate(gen, verbose=0)
+    print(f"\n{split_label} — loss: {loss:.4f} | acc: {acc:.4f}")
+
+    y_true = gen.classes
+    y_prob = model.predict(gen, verbose=0).ravel()
+    y_pred = (y_prob > 0.5).astype("int32")
+
+    print("\nRelatório de Classificação:")
+    print(classification_report(y_true, y_pred, target_names=class_names, digits=4))
+
+    cm = confusion_matrix(y_true, y_pred)
+    plot_confusion(cm, class_names, f"Matriz de Confusão — {split_label}")
+    show_misclassified(gen, y_true, y_pred, class_names, split_name=split_label)
+
+# =========================
+# Dados
+# =========================
+print("Carregando dados...")
+train_gen = make_gen("train")
+val_gen   = make_gen("val")
+test_gen  = make_gen("test")
+
+print("train.class_indices:", train_gen.class_indices)
+print("val.class_indices:  ", val_gen.class_indices)
+assert train_gen.class_indices == val_gen.class_indices, "Classes/ordem diferentes entre train e val."
+
+ok_no_leak = check_leakage(train_gen, val_gen, test_gen)
+if not ok_no_leak:
+    print("\033[91mRevise as pastas antes de confiar nas métricas.\033[0m")
+
+steps_per_epoch  = math.ceil(train_gen.samples / BATCH)
+validation_steps = math.ceil(val_gen.samples   / BATCH)
+
+# =========================
+# Modelo
+# =========================
+base = EfficientNetB0(include_top=False, weights="imagenet", input_shape=(*IMG_SIZE, 3))
+base.trainable = False  # warmup
+
+x = layers.GlobalAveragePooling2D()(base.output)
+x = layers.Dropout(0.4)(x)
+out = layers.Dense(1, activation="sigmoid")(x)
+model = models.Model(base.input, out)
+
+# Warmup (cabeça)
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="binary_crossentropy", metrics=["accuracy"])
+print("\n===== Treinando (warmup) =====")
+model.fit(
+    train_gen,
+    epochs=EPOCHS_WARMUP,
+    steps_per_epoch=steps_per_epoch,
+    validation_data=val_gen,
+    validation_steps=validation_steps,
+    verbose=1
 )
 
-test_datagen = ImageDataGenerator(rescale=1. / 255)
-
-# Geradores de treino, teste e validação
-train_generator = generator(train_datagen, train_dir, img_height, img_width, batch_size)
-val_generator = generator(test_datagen, val_dir, img_height, img_width, batch_size)
-test_generator = generator(test_datagen, test_dir, img_height, img_width, batch_size)
-
-
-base_model = EfficientNetB0(
-    weights="imagenet",
-    include_top=False,
-    input_shape=(img_height, img_width, 3)
+# Fine-tuning (parcial)
+for layer in base.layers[:-20]:
+    layer.trainable = False
+for layer in base.layers[-20:]:
+    layer.trainable = True
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-4), loss="binary_crossentropy", metrics=["accuracy"])
+print("\n===== Treinando (fine-tuning) =====")
+model.fit(
+    train_gen,
+    epochs=EPOCHS_FT,
+    steps_per_epoch=steps_per_epoch,
+    validation_data=val_gen,
+    validation_steps=validation_steps,
+    verbose=1
 )
 
-base_model.trainable = False
+# =========================
+# Avaliação final (val e test)
+# =========================
+print("\n===== Avaliação =====")
+evaluate_split(model, val_gen,  "Validação")
+evaluate_split(model, test_gen, "Teste")
 
-x = GlobalAveragePooling2D()(base_model.output)
-x = Dropout(0.4)(x)
-output = Dense(1, activation="sigmoid")(x)
-
-model = Model(inputs=base_model.input, outputs=output)
-
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-    loss="binary_crossentropy",
-    metrics=["accuracy"]
-)
-
-callbacks = None
-
-GPU = tf.config.list_physical_devices('GPU')
-if GPU:
-    try:
-        with tf.device('/GPU:0'):
-            history = model.fit(
-                train_generator,
-                epochs=epochs,
-                validation_data=val_generator,
-                callbacks=callbacks
-            )
-    except RuntimeError as e:
-        print(e)
+# =========================
+# Conclusão automática
+# =========================
+if ok_no_leak:
+    print("\n\033[92m[CONCLUSÃO]\033[0m Sem vazamento detectado por nome/hash. "
+          "Resultados consistentes para encerrar o dia — boa noite. 😴")
 else:
-    history = model.fit(
-        train_generator,
-        epochs=epochs,
-        validation_data=val_generator,
-        callbacks=callbacks
-    )
-
-# antes de callbacks
-os.makedirs("Model", exist_ok=True)
-
-callbacks = [
-    EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
-    # use o formato nativo .keras (evita vários problemas de serialização)
-    ModelCheckpoint("Model/efficientNet_tomato.keras", monitor="val_loss", save_best_only=True),
-    ReduceLROnPlateau(monitor="val_loss", factor=0.2, patience=3, verbose=1)
-]
-
-loss, acc = model.evaluate(test_generator)
-print(f"\nAcurácia no conjunto de teste: {acc:.4f}")
-
+    print("\n\033[93m[ATENÇÃO]\033[0m Houve indício de vazamento. "
+          "Ajuste os diretórios antes de considerar o treinamento concluído.")
